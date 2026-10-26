@@ -1,0 +1,18 @@
+#compdef netwatch netping
+
+_netwatch() {
+    local -a options
+    options=(
+        '-i[Interval between pings in seconds (default: 3)]:seconds:'
+        '-t[Reply timeout in seconds (default: 2)]:seconds:'
+        '-l[Export ping metrics to CSV log file]:file:_files'
+        '-a[Enable audio bell and OS notifications on outage]'
+        '-g[Automatically include default router/gateway]'
+        '(-v --version)'{-v,--version}'[Show version and system architecture]'
+        '(-h --help)'{-h,--help}'[Show help message and exit]'
+        '*:target host:_hosts'
+    )
+    _arguments -s -S $options
+}
+
+_netwatch "$@"

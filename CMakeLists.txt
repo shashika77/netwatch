@@ -11,20 +11,22 @@ else()
     add_compile_options(-Wall -Wextra -pedantic -O2)
 endif()
 
-# Executables
+# Executable
 add_executable(netwatch netwatch.cpp)
-add_executable(netping netping.cpp)
 
 if(WIN32)
     target_link_libraries(netwatch PRIVATE ws2_32 iphlpapi)
-    target_link_libraries(netping PRIVATE ws2_32 iphlpapi)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(netwatch PRIVATE Threads::Threads)
-    target_link_libraries(netping PRIVATE Threads::Threads)
 endif()
 
 include(GNUInstallDirs)
-install(TARGETS netwatch netping
+install(TARGETS netwatch
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+# Symlink netping -> netwatch on non-Windows
+if(UNIX)
+    install(CODE "execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink netwatch \${CMAKE_INSTALL_FULL_BINDIR}/netping)")
+endif()

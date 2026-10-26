@@ -156,8 +156,17 @@ static void platformCleanupSockets() {
 #endif
 
 static volatile sig_atomic_t g_quitRequested = 0;
+static volatile sig_atomic_t g_resized = 0;
 
-static void handleSignal(int) {
+static void handleSignal(int sig) {
+#ifndef _WIN32
+    if (sig == SIGWINCH) {
+        g_resized = 1;
+        return;
+    }
+#else
+    (void)sig;
+#endif
     g_quitRequested = 1;
 }
 
@@ -205,6 +214,9 @@ static void termEnableRaw() {
 #ifndef _WIN32
     signal(SIGINT, handleSignal);
     signal(SIGTERM, handleSignal);
+    signal(SIGHUP, handleSignal);
+    signal(SIGQUIT, handleSignal);
+    signal(SIGWINCH, handleSignal);
     signal(SIGPIPE, SIG_IGN);
 #endif
     const char *enterAltScreen = "\033[?1049h\033[?25l\033[2J";
@@ -226,8 +238,8 @@ static void getTermSize(int &cols, int &rows) {
         rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
     }
 #endif
-    if (cols < 60) cols = 60;
-    if (rows < 15) rows = 15;
+    if (cols < 20) cols = 20;
+    if (rows < 5) rows = 5;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -306,6 +318,107 @@ static string toLower(string s) {
     return s;
 }
 
+static size_t visibleWidth(const string &s) {
+    size_t width = 0;
+    size_t i = 0;
+    size_t len = s.size();
+    while (i < len) {
+        if (s[i] == '\033') {
+            i++;
+            if (i < len && s[i] == '[') {
+                i++;
+                while (i < len && (s[i] < '@' || s[i] > '~')) i++;
+                if (i < len) i++;
+            }
+            continue;
+        }
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            if (c >= 32 && c != 127) width++;
+            i++;
+        } else if ((c & 0xE0) == 0xC0) {
+            width++;
+            i += (i + 1 < len) ? 2 : 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            width++;
+            i += (i + 2 < len) ? 3 : 1;
+        } else if ((c & 0xF8) == 0xF0) {
+            width += 2;
+            i += (i + 3 < len) ? 4 : 1;
+        } else {
+            i++;
+        }
+    }
+    return width;
+}
+
+static string truncateToWidth(const string &s, size_t maxCols) {
+    size_t width = 0;
+    size_t i = 0;
+    size_t len = s.size();
+    size_t cutByte = len;
+    bool hasEscape = false;
+
+    while (i < len) {
+        if (s[i] == '\033') {
+            hasEscape = true;
+            i++;
+            if (i < len && s[i] == '[') {
+                i++;
+                while (i < len && (s[i] < '@' || s[i] > '~')) i++;
+                if (i < len) i++;
+            }
+            continue;
+        }
+        size_t charW = 1;
+        size_t nextI = i + 1;
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            charW = (c >= 32 && c != 127) ? 1 : 0;
+            nextI = i + 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            charW = 1;
+            nextI = (i + 1 < len) ? i + 2 : len;
+        } else if ((c & 0xF0) == 0xE0) {
+            charW = 1;
+            nextI = (i + 2 < len) ? i + 3 : len;
+        } else if ((c & 0xF8) == 0xF0) {
+            charW = 2;
+            nextI = (i + 3 < len) ? i + 4 : len;
+        }
+
+        if (width + charW > maxCols) {
+            cutByte = i;
+            break;
+        }
+        width += charW;
+        i = nextI;
+    }
+
+    if (cutByte >= len) return s;
+    string res = s.substr(0, cutByte);
+    if (hasEscape) res += "\033[0m";
+    return res;
+}
+
+static string cleanHost(const string &raw) {
+    string s = trim(raw);
+    if (s.empty()) return s;
+    size_t scheme = s.find("://");
+    if (scheme != string::npos) s = s.substr(scheme + 3);
+    size_t slash = s.find('/');
+    if (slash != string::npos) s = s.substr(0, slash);
+    if (!s.empty() && s[0] == '[') {
+        size_t bClose = s.find(']');
+        if (bClose != string::npos) s = s.substr(1, bClose - 1);
+    } else {
+        size_t fCol = s.find(':');
+        size_t lCol = s.rfind(':');
+        if (fCol != string::npos && fCol == lCol) s = s.substr(0, fCol);
+    }
+    return trim(s);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Process Execution Helper
 // ═════════════════════════════════════════════════════════════
@@ -357,6 +470,58 @@ static uint16_t icmpChecksum(const void *data, size_t len) {
     return htons((uint16_t)~sum);
 }
 
+static bool doSystemPing(const string &targetHost, int fam, int timeoutSec, Probe &p) {
+    auto t0 = Clock::now();
+    string cmd;
+#if defined(_WIN32)
+    cmd = fmt("ping %s -n 1 -w %d %s", (fam == AF_INET6 ? "-6" : "-4"), timeoutSec * 1000, targetHost.c_str());
+#elif defined(__APPLE__)
+    if (fam == AF_INET6) {
+        cmd = fmt("ping6 -c 1 -t %d %s 2>&1", timeoutSec, targetHost.c_str());
+    } else {
+        cmd = fmt("ping -c 1 -t %d %s 2>&1", timeoutSec, targetHost.c_str());
+    }
+#else
+    if (fam == AF_INET6) {
+        cmd = fmt("ping -6 -c 1 -W %d %s 2>&1 || ping6 -c 1 -W %d %s 2>&1", timeoutSec, targetHost.c_str(), timeoutSec, targetHost.c_str());
+    } else {
+        cmd = fmt("ping -c 1 -W %d %s 2>&1", timeoutSec, targetHost.c_str());
+    }
+#endif
+    auto lines = runCmdLines(cmd, 15);
+    auto t1 = Clock::now();
+    double fallbackMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    for (const auto &l : lines) {
+        string lower = toLower(l);
+        size_t tPos = lower.find("time=");
+        if (tPos == string::npos) tPos = lower.find("time<");
+
+        if (tPos != string::npos && (lower.find("bytes") != string::npos || lower.find("reply from") != string::npos)) {
+            double ms = 0;
+            if (lower[tPos + 4] == '<') {
+                ms = 0.5;
+            } else {
+                sscanf(l.c_str() + tPos + 5, "%lf", &ms);
+            }
+            if (ms <= 0) ms = fallbackMs;
+            p.ok = true;
+            p.ms = ms;
+
+            size_t ttlPos = lower.find("ttl=");
+            if (ttlPos != string::npos) {
+                int ttl = 0;
+                sscanf(lower.c_str() + ttlPos + 4, "%d", &ttl);
+                p.ttl = ttl;
+            }
+            p.err.clear();
+            return true;
+        }
+    }
+    p.err = "Request timed out";
+    return false;
+}
+
 static Probe doPing(const string &host, int timeoutSec, uint16_t seq) {
     Probe p;
     auto d0 = Clock::now();
@@ -400,109 +565,91 @@ static Probe doPing(const string &host, int timeoutSec, uint16_t seq) {
     p.ip = ipbuf;
 
 #ifndef _WIN32
-    int s = socket(fam, SOCK_DGRAM, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
-    if (s < 0) {
-        // Fallback to SOCK_RAW if allowed
-        s = socket(fam, SOCK_RAW, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
+    bool trySocket = true;
+#if defined(__APPLE__)
+    if (getuid() != 0) {
+        trySocket = false;
+    }
+#endif
+
+    if (trySocket) {
+        int s = socket(fam, SOCK_DGRAM, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
         if (s < 0) {
-            p.err = string("Socket error: ") + strerror(errno);
-            return p;
+            s = socket(fam, SOCK_RAW, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
         }
-    }
 
-    uint8_t pkt[64];
-    memset(pkt, 0, sizeof(pkt));
-    for (size_t i = 8; i < sizeof(pkt); i++) pkt[i] = (uint8_t)(i & 0xFF);
-    uint16_t id = (uint16_t)getpid();
-    pkt[0] = (fam == AF_INET) ? ICMP_ECHO : ICMP6_ECHO_REQUEST;
-    pkt[1] = 0;
-    pkt[4] = (uint8_t)(id >> 8);  pkt[5] = (uint8_t)id;
-    pkt[6] = (uint8_t)(seq >> 8); pkt[7] = (uint8_t)seq;
-    if (fam == AF_INET) {
-        uint16_t cs = icmpChecksum(pkt, sizeof(pkt));
-        memcpy(pkt + 2, &cs, 2);
-    }
-
-    auto t0 = Clock::now();
-    auto deadline = t0 + std::chrono::seconds(timeoutSec);
-
-    if (sendto(s, (const char *)pkt, sizeof(pkt), 0, (sockaddr *)&dst, dlen) < 0) {
-        p.err = string("Sendto failed: ") + strerror(errno);
-        CLOSE_SOCK(s);
-        return p;
-    }
-
-    uint8_t buf[2048];
-    for (;;) {
-        long left = (long)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
-        if (left <= 0) { p.err = "Request timed out"; break; }
-        pollfd pfd{s, POLLIN, 0};
-        int pr = poll(&pfd, 1, (int)left);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            p.err = strerror(errno);
-            break;
-        }
-        if (pr == 0) { p.err = "Request timed out"; break; }
-
-        sockaddr_storage from{};
-        socklen_t flen = sizeof(from);
-        ssize_t n = recvfrom(s, (char *)buf, sizeof(buf), 0, (sockaddr *)&from, &flen);
-        auto t1 = Clock::now();
-        if (n <= 0) continue;
-
-        const uint8_t *icmp = buf;
-        size_t len = (size_t)n;
-        int ttl = 0;
-        if (fam == AF_INET && len >= 20 && (buf[0] >> 4) == 4) {
-            size_t ihl = (size_t)(buf[0] & 0x0F) * 4;
-            if (ihl <= len) {
-                ttl = buf[8];
-                icmp += ihl;
-                len -= ihl;
+        if (s >= 0) {
+            uint8_t pkt[64];
+            memset(pkt, 0, sizeof(pkt));
+            for (size_t i = 8; i < sizeof(pkt); i++) pkt[i] = (uint8_t)(i & 0xFF);
+            uint16_t id = (uint16_t)getpid();
+            pkt[0] = (fam == AF_INET) ? ICMP_ECHO : ICMP6_ECHO_REQUEST;
+            pkt[1] = 0;
+            pkt[4] = (uint8_t)(id >> 8);  pkt[5] = (uint8_t)id;
+            pkt[6] = (uint8_t)(seq >> 8); pkt[7] = (uint8_t)seq;
+            if (fam == AF_INET) {
+                uint16_t cs = icmpChecksum(pkt, sizeof(pkt));
+                memcpy(pkt + 2, &cs, 2);
             }
-        }
-        if (len < 8) continue;
 
-        uint8_t replyType = (fam == AF_INET) ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY;
-        uint16_t rseq = (uint16_t)((icmp[6] << 8) | icmp[7]);
-        if (icmp[0] == replyType && rseq == seq) {
-            p.ok = true;
-            p.ttl = ttl;
-            p.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            break;
-        }
-        if (fam == AF_INET && icmp[0] == ICMP_UNREACH) {
-            p.err = "Destination unreachable";
-            break;
+            auto t0 = Clock::now();
+            auto deadline = t0 + std::chrono::seconds(timeoutSec);
+
+            if (sendto(s, (const char *)pkt, sizeof(pkt), 0, (sockaddr *)&dst, dlen) >= 0) {
+                uint8_t buf[2048];
+                for (;;) {
+                    long left = (long)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                    if (left <= 0) break;
+                    pollfd pfd{s, POLLIN, 0};
+                    int pr = poll(&pfd, 1, (int)left);
+                    if (pr < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    if (pr == 0) break;
+
+                    sockaddr_storage from{};
+                    socklen_t flen = sizeof(from);
+                    ssize_t n = recvfrom(s, (char *)buf, sizeof(buf), 0, (sockaddr *)&from, &flen);
+                    auto t1 = Clock::now();
+                    if (n <= 0) continue;
+
+                    const uint8_t *icmp = buf;
+                    size_t len = (size_t)n;
+                    int ttl = 0;
+                    if (fam == AF_INET && len >= 20 && (buf[0] >> 4) == 4) {
+                        size_t ihl = (size_t)(buf[0] & 0x0F) * 4;
+                        if (ihl <= len) {
+                            ttl = buf[8];
+                            icmp += ihl;
+                            len -= ihl;
+                        }
+                    }
+                    if (len < 8) continue;
+
+                    uint8_t replyType = (fam == AF_INET) ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY;
+                    uint16_t rseq = (uint16_t)((icmp[6] << 8) | icmp[7]);
+                    if (icmp[0] == replyType && rseq == seq) {
+                        p.ok = true;
+                        p.ttl = ttl;
+                        p.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                        break;
+                    }
+                    if (fam == AF_INET && icmp[0] == ICMP_UNREACH) {
+                        p.err = "Destination unreachable";
+                        break;
+                    }
+                }
+            }
+            CLOSE_SOCK(s);
         }
     }
-    CLOSE_SOCK(s);
+
+    if (!p.ok) {
+        doSystemPing(p.ip.empty() ? host : p.ip, fam, timeoutSec, p);
+    }
 #else
-    // Windows fallback ping
-    string winPing = fmt("ping -n 1 -w %d %s", timeoutSec * 1000, host.c_str());
-    auto lines = runCmdLines(winPing, 10);
-    bool found = false;
-    for (const auto &l : lines) {
-        if (l.find("Reply from") != string::npos || l.find("bytes=") != string::npos) {
-            size_t tPos = l.find("time=");
-            size_t ttlPos = l.find("TTL=");
-            if (tPos != string::npos) {
-                double ms = 0;
-                sscanf(l.c_str() + tPos + 5, "%lf", &ms);
-                p.ok = true;
-                p.ms = ms;
-                found = true;
-            }
-            if (ttlPos != string::npos) {
-                int ttl = 0;
-                sscanf(l.c_str() + ttlPos + 4, "%d", &ttl);
-                p.ttl = ttl;
-            }
-            break;
-        }
-    }
-    if (!found) p.err = "Request timed out";
+    doSystemPing(p.ip.empty() ? host : p.ip, fam, timeoutSec, p);
 #endif
     return p;
 }
@@ -564,7 +711,7 @@ static string g_logPath;
 static Clock::time_point START_TIME;
 
 // Active Modal Input State
-enum class ModalMode { NONE, ADD_HOST, SET_INTERVAL, TOOL_CUSTOM_HOST, TOOL_SEARCH };
+enum class ModalMode { NONE, ADD_HOST, SET_INTERVAL, TOOL_CUSTOM_HOST, TOOL_CUSTOM_CMD, TOOL_SEARCH };
 static ModalMode g_modal = ModalMode::NONE;
 static string g_inputBuf;
 static string g_inputPrompt;
@@ -971,7 +1118,7 @@ static void runDnsTool(const string &target) {
                 else if (type == "TXT") badgeColor = C_PUR;
                 else if (type == "NS") badgeColor = C_ORG;
 
-                string badge = col(badgeColor, string(BOLD) + fmt("[% -4s]", type.c_str()));
+                string badge = col(badgeColor, string(BOLD) + fmt("[%-4s]", type.c_str()));
                 string row = fmt("%-16s  %-30s  %-8s  %s",
                     badge.c_str(), name.substr(0, 28).c_str(), ttl.c_str(), val.c_str());
                 g_toolResult.formattedRows.push_back(row);
@@ -987,7 +1134,7 @@ static void runDnsTool(const string &target) {
                 if (l.find("Address:") != string::npos && l.find("#") == string::npos) {
                     string ip = trim(l.substr(8));
                     string type = (ip.find(':') != string::npos) ? "AAAA" : "A";
-                    string badge = col(type == "A" ? C_GRN : C_BLU, string(BOLD) + fmt("[% -4s]", type.c_str()));
+                    string badge = col(type == "A" ? C_GRN : C_BLU, string(BOLD) + fmt("[%-4s]", type.c_str()));
                     g_toolResult.formattedRows.push_back(fmt("%-16s  %-30s  %-8s  %s", badge.c_str(), target.c_str(), "auto", ip.c_str()));
                     recordCount++;
                 }
@@ -1008,7 +1155,7 @@ static void runDnsTool(const string &target) {
                         inet_ntop(AF_INET6, &((sockaddr_in6 *)a->ai_addr)->sin6_addr, ipbuf, sizeof(ipbuf));
                     }
                     if (ipbuf[0]) {
-                        string badge = col(type == "A" ? C_GRN : C_BLU, string(BOLD) + fmt("[% -4s]", type.c_str()));
+                        string badge = col(type == "A" ? C_GRN : C_BLU, string(BOLD) + fmt("[%-4s]", type.c_str()));
                         g_toolResult.formattedRows.push_back(fmt("%-16s  %-30s  %-8s  %s", badge.c_str(), target.c_str(), "native", ipbuf));
                         recordCount++;
                     }
@@ -1537,7 +1684,7 @@ static void launchTool(int toolId, const string &target) {
         case 7: runSocketsTool(); break;
         case 8: runTrafficTool(); break;
         case 9:
-            g_modal = ModalMode::TOOL_CUSTOM_HOST;
+            g_modal = ModalMode::TOOL_CUSTOM_CMD;
             g_inputPrompt = "Enter custom command to run (e.g. nmap -F " + target + "): ";
             g_inputBuf = "nmap -F " + target;
             break;
@@ -1638,7 +1785,6 @@ static void viewOverview(int cols, int rows) {
     int cardRows = (rows - fixedRows) / (int)n;
     cardRows = std::max(4, std::min(10, cardRows));
     int chartHeight = std::max(1, cardRows - 4);
-    int innerW = cols - 4;
 
     for (size_t i = 0; i < n; i++) {
         Site &s = sites[i];
@@ -1654,7 +1800,7 @@ static void viewOverview(int cols, int rows) {
         string titleStr = (isSel ? col(C_WHT, string(BOLD) + " ▶ " + s.name + " ") : col(C_GRY, "   " + s.name + " ")) +
                           col(C_DGRY, "(" + s.host + (s.ip.empty() ? "" : " · " + s.ip) + ")");
         string rightStr = (spark.empty() ? "" : spark + "  ") + badgeStr + col(C_GRY, hopStr) + " ";
-        int padTop = std::max(1, innerW - 35 - (int)s.name.size() - (int)s.host.size());
+        int padTop = std::max(1, cols - 6 - (int)visibleWidth(titleStr) - (int)visibleWidth(rightStr));
 
         addLine(borderColor + "╭─ " + RST + titleStr + string(padTop, ' ') + rightStr + borderColor + "─╮" + RST);
 
@@ -1663,23 +1809,33 @@ static void viewOverview(int cols, int rows) {
         double loss = s.sent ? ((s.sent - s.recv) * 100.0 / s.sent) : 0;
         string nowVal = s.ok ? col(latColor(s.ms), string(BOLD) + fmt("%.1fms", s.ms)) : col(C_RED, string(BOLD) + "TIMEOUT");
 
-        string statLine = borderColor + "│" + RST + " " +
-            col(C_GRY, "RTT: ") + nowVal + "   " +
-            col(C_GRY, "Avg: ") + col(latColor(avg), fmt("%.1fms", avg)) + "   " +
-            col(C_GRY, "Min: ") + fmt("%.1fms", s.mn) + "   " +
-            col(C_GRY, "Max: ") + fmt("%.1fms", s.mx) + "   " +
-            col(C_GRY, "P95: ") + fmt("%.1fms", s.p95) + "   " +
-            col(C_GRY, "Jitter: ") + fmt("%.1fms", s.jitter) + "   " +
-            col(C_GRY, "Loss: ") + (loss > 0 ? col(C_RED, fmt("%.1f%%", loss)) : col(C_GRN, "0.0%")) +
-            (s.loss60 > 0 ? col(C_ORG, fmt(" (60s: %.0f%%)", s.loss60)) : "");
+        string statLine;
+        if (cols >= 95) {
+            statLine = borderColor + "│" + RST + " " +
+                col(C_GRY, "RTT: ") + nowVal + "   " +
+                col(C_GRY, "Avg: ") + col(latColor(avg), fmt("%.1fms", avg)) + "   " +
+                col(C_GRY, "Min: ") + fmt("%.1fms", s.mn) + "   " +
+                col(C_GRY, "Max: ") + fmt("%.1fms", s.mx) + "   " +
+                col(C_GRY, "P95: ") + fmt("%.1fms", s.p95) + "   " +
+                col(C_GRY, "Jitter: ") + fmt("%.1fms", s.jitter) + "   " +
+                col(C_GRY, "Loss: ") + (loss > 0 ? col(C_RED, fmt("%.1f%%", loss)) : col(C_GRN, "0.0%")) +
+                (s.loss60 > 0 ? col(C_ORG, fmt(" (60s: %.0f%%)", s.loss60)) : "");
+        } else {
+            statLine = borderColor + "│" + RST + " " +
+                col(C_GRY, "RTT: ") + nowVal + "  " +
+                col(C_GRY, "Avg: ") + col(latColor(avg), fmt("%.1fms", avg)) + "  " +
+                col(C_GRY, "Min/Max: ") + fmt("%.0f/%.0fms", s.mn, s.mx) + "  " +
+                col(C_GRY, "Loss: ") + (loss > 0 ? col(C_RED, fmt("%.1f%%", loss)) : col(C_GRN, "0%")) + "  " +
+                col(C_GRY, "Jitter: ") + fmt("%.1fms", s.jitter);
+        }
 
         addLine(statLine);
 
         // Bar Chart
-        renderBigChart(s.hist, cols - 12, chartHeight, borderColor + "│ " + RST);
+        renderBigChart(s.hist, std::max(10, cols - 12), chartHeight, borderColor + "│ " + RST);
 
         // Bottom Border
-        addLine(borderColor + "╰" + repeat("─", cols - 2) + "╯" + RST);
+        addLine(borderColor + "╰" + repeat("─", std::max(2, cols - 2)) + "╯" + RST);
     }
 }
 
@@ -1741,7 +1897,8 @@ static void viewCompare(int cols, int rows) {
         }
         addLine(line);
     }
-    addLine(col(C_DGRY, "       " + repeat("─", std::min(plotW, cols - 10)) + "  ms · past ← → now"));
+    int axisDash = std::max(2, cols - 28);
+    addLine(col(C_DGRY, "       " + repeat("─", axisDash) + "  ms · past ← → now"));
 
     // Loss Strip
     addLine("");
@@ -1761,15 +1918,19 @@ static void viewCompare(int cols, int rows) {
 //  View 3: Deep-Dive Single Host Inspector
 // ═════════════════════════════════════════════════════════════
 static void viewDetail(int cols, int rows) {
-    if (sites.empty()) return;
+    if (sites.empty()) {
+        addLine(col(C_GRY, "  No target sites configured. Press 'a' to add a host."));
+        return;
+    }
     Site &s = sites[SEL_SITE % sites.size()];
     SiteHealth hlth = healthOf(s);
     int hops = hopsFrom(s.ttl);
 
     // Host Header Banner
-    addLine(col(C_CYN, "╭─") + " " + BOLD + s.name + RST + "  " + col(hlth.color, hlth.badge) +
-            col(C_GRY, "  (Press Tab or ← → to switch target, 't' for Toolbox)") + " " +
-            col(C_CYN, repeat("─", std::max(2, cols - 50))) + "╮");
+    string hostBannerTitle = string("╭─ ") + BOLD + s.name + RST + "  " + col(hlth.color, hlth.badge);
+    string hostBannerHint = (cols >= 90) ? "  (Tab/j/k: target · Enter: Toolbox) " : " ";
+    int bannerPad = std::max(2, cols - 3 - (int)visibleWidth(hostBannerTitle) - (int)visibleWidth(hostBannerHint));
+    addLine(col(C_CYN, hostBannerTitle + hostBannerHint + repeat("─", bannerPad) + "╮"));
 
     string sub = fmt("  Host: %s   IP: %s   DNS: %.1fms   TTL: %d (%s)",
                      s.host.c_str(), s.ip.c_str(), s.dnsMs, s.ttl,
@@ -1813,13 +1974,13 @@ static void viewDetail(int cols, int rows) {
     addLine("");
 
     // High-Resolution Latency Chart
-    int histRows = 10;
+    int histRows = 7;
     int chartHeight = rows - (int)g_frameLines.size() - histRows - 6;
     chartHeight = std::max(3, std::min(12, chartHeight));
     addLine(BOLD + string("  Recent Latency Trend") + RST + col(C_GRY, " (ms per sample)"));
-    renderBigChart(s.hist, cols - 12, chartHeight, "  ");
+    renderBigChart(s.hist, std::max(10, cols - 12), chartHeight, "  ");
 
-    // Distribution Histogram
+    // Distribution Histogram (Compact 2-Column Layout)
     static const double edges[] = {5, 10, 20, 35, 50, 75, 100, 150, 250, 500, 1e18};
     static const char *names[] = {"<5ms", "5-10ms", "10-20ms", "20-35ms", "35-50ms", "50-75ms",
                                   "75-100", "100-150", "150-250", "250-500", "500ms+"};
@@ -1835,14 +1996,32 @@ static void viewDetail(int cols, int rows) {
     int cmax = 1;
     for (int b = 0; b < 11; b++) cmax = std::max(cmax, counts[b]);
     addLine("");
-    addLine(BOLD + string("  Latency Distribution") + RST + col(C_GRY, " (reply distribution buckets)"));
-    int barW = std::max(10, cols - 32);
-    for (int b = 0; b < 11; b++) {
-        int w = counts[b] * barW / cmax;
-        if (counts[b] > 0 && w < 1) w = 1;
-        double rep = (b == 10) ? 600 : (edges[b] - 0.1);
-        addLine("  " + col(C_GRY, fmt("%8s ", names[b])) + string(latColor(rep)) + repeat("█", w) + RST + " " +
-                col(C_GRY, fmt("%d (%.0f%%)", counts[b], total ? counts[b] * 100.0 / total : 0.0)));
+    addLine(BOLD + string("  Latency Distribution") + RST + col(C_GRY, total > 0 ? fmt(" (reply distribution across %d samples)", total) : " (reply distribution buckets)"));
+    int colW = std::max(15, (cols - 8) / 2);
+    int barW = std::max(6, colW - 20);
+
+    for (int r = 0; r < 6; r++) {
+        int b1 = r;
+        int b2 = r + 6;
+        string leftStr, rightStr;
+
+        int w1 = counts[b1] * barW / cmax;
+        if (counts[b1] > 0 && w1 < 1) w1 = 1;
+        double rep1 = (b1 == 10) ? 600 : (edges[b1] - 0.1);
+        leftStr = col(C_GRY, fmt("%-7s ", names[b1])) + string(latColor(rep1)) + repeat("█", w1) + RST + " " +
+                  col(C_GRY, fmt("%d", counts[b1]));
+
+        int padLeft = std::max(1, colW - (int)visibleWidth(leftStr));
+        leftStr += string(padLeft, ' ');
+
+        if (b2 < 11) {
+            int w2 = counts[b2] * barW / cmax;
+            if (counts[b2] > 0 && w2 < 1) w2 = 1;
+            double rep2 = (b2 == 10) ? 600 : (edges[b2] - 0.1);
+            rightStr = col(C_GRY, fmt("%-7s ", names[b2])) + string(latColor(rep2)) + repeat("█", w2) + RST + " " +
+                       col(C_GRY, fmt("%d", counts[b2]));
+        }
+        addLine("  " + leftStr + rightStr);
     }
 }
 
@@ -1893,23 +2072,39 @@ static void viewOutages(int cols, int rows) {
 //  View 5: Network Toolbox (Interactive Diagnostics Hub)
 // ═════════════════════════════════════════════════════════════
 static void viewToolbox(int cols, int rows) {
-    string target = sites.empty() ? "1.1.1.1" : sites[SEL_SITE % sites.size()].host;
+    string target = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
     if (!g_toolResult.targetHost.empty()) target = g_toolResult.targetHost;
 
     // Toolbox Subnav Menu
     addLine(col(C_CYN, "╭─ [ NETWORK TOOLBOX ] ") + repeat("─", std::max(2, cols - 26)) + "╮");
 
-    string toolsLine = "  " +
-        col(TOOL_ACTIVE_ID == 1 ? C_CYN : C_GRY, "[1 Traceroute]") + " " +
-        col(TOOL_ACTIVE_ID == 2 ? C_CYN : C_GRY, "[2 DNS (dig)]") + " " +
-        col(TOOL_ACTIVE_ID == 3 ? C_CYN : C_GRY, "[3 Port Scan]") + " " +
-        col(TOOL_ACTIVE_ID == 4 ? C_CYN : C_GRY, "[4 HTTP/curl]") + " " +
-        col(TOOL_ACTIVE_ID == 5 ? C_CYN : C_GRY, "[5 Interfaces]") + " " +
-        col(TOOL_ACTIVE_ID == 6 ? C_CYN : C_GRY, "[6 Routes]") + " " +
-        col(TOOL_ACTIVE_ID == 7 ? C_CYN : C_GRY, "[7 Sockets]") + " " +
-        col(TOOL_ACTIVE_ID == 8 ? C_CYN : C_GRY, "[8 Traffic]") + " " +
-        col(TOOL_ACTIVE_ID == 9 ? C_CYN : C_GRY, "[9 Custom]");
-    addLine(toolsLine);
+    if (cols >= 110) {
+        string toolsLine = "  " +
+            col(TOOL_ACTIVE_ID == 1 ? C_CYN : C_GRY, "[1 Traceroute]") + " " +
+            col(TOOL_ACTIVE_ID == 2 ? C_CYN : C_GRY, "[2 DNS (dig)]") + " " +
+            col(TOOL_ACTIVE_ID == 3 ? C_CYN : C_GRY, "[3 Port Scan]") + " " +
+            col(TOOL_ACTIVE_ID == 4 ? C_CYN : C_GRY, "[4 HTTP/curl]") + " " +
+            col(TOOL_ACTIVE_ID == 5 ? C_CYN : C_GRY, "[5 Interfaces]") + " " +
+            col(TOOL_ACTIVE_ID == 6 ? C_CYN : C_GRY, "[6 Routes]") + " " +
+            col(TOOL_ACTIVE_ID == 7 ? C_CYN : C_GRY, "[7 Sockets]") + " " +
+            col(TOOL_ACTIVE_ID == 8 ? C_CYN : C_GRY, "[8 Traffic]") + " " +
+            col(TOOL_ACTIVE_ID == 9 ? C_CYN : C_GRY, "[9 Custom]");
+        addLine(toolsLine);
+    } else {
+        string l1 = "  " +
+            col(TOOL_ACTIVE_ID == 1 ? C_CYN : C_GRY, "[1 Traceroute]") + " " +
+            col(TOOL_ACTIVE_ID == 2 ? C_CYN : C_GRY, "[2 DNS (dig)]") + " " +
+            col(TOOL_ACTIVE_ID == 3 ? C_CYN : C_GRY, "[3 Port Scan]") + " " +
+            col(TOOL_ACTIVE_ID == 4 ? C_CYN : C_GRY, "[4 HTTP/curl]") + " " +
+            col(TOOL_ACTIVE_ID == 5 ? C_CYN : C_GRY, "[5 Interfaces]");
+        string l2 = "  " +
+            col(TOOL_ACTIVE_ID == 6 ? C_CYN : C_GRY, "[6 Routes]") + " " +
+            col(TOOL_ACTIVE_ID == 7 ? C_CYN : C_GRY, "[7 Sockets]") + " " +
+            col(TOOL_ACTIVE_ID == 8 ? C_CYN : C_GRY, "[8 Traffic]") + " " +
+            col(TOOL_ACTIVE_ID == 9 ? C_CYN : C_GRY, "[9 Custom]");
+        addLine(l1);
+        addLine(l2);
+    }
 
     // Target Selector & Status
     string targetDisplay = col(C_WHT, BOLD + target) + col(C_GRY, "  (Press 'c' for custom target, Tab to cycle hosts)");
@@ -2004,13 +2199,31 @@ static void renderFrame(bool checking, Clock::time_point lastCheck) {
     getTermSize(cols, rows);
     g_frameLines.clear();
 
+    if (cols < 48 || rows < 10) {
+        addLine(col(C_CYN, string(BOLD) + " ◉ NETWATCH PRO 3.0 "));
+        addLine("");
+        addLine(col(C_YEL, fmt("  Terminal size (%dx%d) is too small.", cols, rows)));
+        addLine(col(C_GRY, "  Please expand your terminal window (min 48x10)."));
+        while ((int)g_frameLines.size() < rows - 1) addLine("");
+        g_frameLines.push_back(col(DIM, " q to quit"));
+        string frameBuffer = "\033[H";
+        for (size_t i = 0; i < g_frameLines.size(); i++) {
+            frameBuffer += truncateToWidth(g_frameLines[i], (size_t)cols);
+            frameBuffer += "\033[K";
+            if (i + 1 < g_frameLines.size()) frameBuffer += "\n";
+        }
+        frameBuffer += "\033[J";
+        (void)!write(STDOUT_FILENO, frameBuffer.data(), frameBuffer.size());
+        return;
+    }
+
     long nowMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - START_TIME).count();
     const char *spin = SPIN[(nowMs / 100) % 10];
 
     // Top Header Bar
     string title = " ◉ NETWATCH PRO 3.0 ";
     string right = timeStr(time(nullptr), "%a %d %b %H:%M:%S") + " ";
-    int padHdr = std::max(1, cols - (int)title.size() - (int)right.size());
+    int padHdr = std::max(1, cols - (int)visibleWidth(title) - (int)visibleWidth(right));
     addLine(string(BG_HDR) + BOLD + title + string(padHdr, ' ') + right + RST);
 
     // Tab Bar
@@ -2051,7 +2264,7 @@ static void renderFrame(bool checking, Clock::time_point lastCheck) {
         string modalBorder = col(C_YEL, "╭── " + g_inputPrompt + repeat("─", std::max(2, cols - (int)g_inputPrompt.size() - 10)) + "╮");
         string modalBody = col(C_YEL, "│ ") + BOLD + g_inputBuf + col(C_GRN, "█") +
                            string(std::max(1, cols - 6 - (int)g_inputBuf.size()), ' ') + col(C_YEL, "│");
-        string modalFoot = col(C_YEL, "╰── (Press Enter to confirm, Esc to cancel) " + repeat("─", std::max(2, cols - 48)) + "╯");
+        string modalFoot = col(C_YEL, "╰── (Press Enter to confirm, Esc or Ctrl+C to cancel) " + repeat("─", std::max(2, cols - 58)) + "╯");
         addLine(modalBorder);
         addLine(modalBody);
         addLine(modalFoot);
@@ -2087,13 +2300,13 @@ static void renderFrame(bool checking, Clock::time_point lastCheck) {
     while ((int)g_frameLines.size() < rows - 1) addLine("");
     if ((int)g_frameLines.size() > rows - 1) g_frameLines.resize(rows - 1);
 
-    string footer = " 1-6 Views · Tab Host · a Add Host · t Toolbox · r Ping · p Pause · +/- Interval · q Quit";
+    string footer = " 1-6 Views · Tab/j/k Host · Enter Detail · a Add · t Toolbox · r Ping · p Pause · q Quit";
     g_frameLines.push_back(col(DIM, footer));
 
-    // Atomic screen update
+    // Atomic screen update with line clamping to eliminate all wrapping & jitter
     string frameBuffer = "\033[H";
     for (size_t i = 0; i < g_frameLines.size(); i++) {
-        frameBuffer += g_frameLines[i];
+        frameBuffer += truncateToWidth(g_frameLines[i], (size_t)cols);
         frameBuffer += "\033[K";
         if (i + 1 < g_frameLines.size()) frameBuffer += "\n";
     }
@@ -2104,27 +2317,56 @@ static void renderFrame(bool checking, Clock::time_point lastCheck) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  CLI Help & Usage
 // ═════════════════════════════════════════════════════════════
+static void showVersion() {
+#if defined(__APPLE__)
+    const char *osName = "macOS";
+#elif defined(__linux__)
+    const char *osName = "Linux";
+#elif defined(_WIN32)
+    const char *osName = "Windows";
+#else
+    const char *osName = "Unix";
+#endif
+
+#if defined(__arm64__) || defined(__aarch64__)
+    const char *arch = "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    const char *arch = "x86_64";
+#else
+    const char *arch = "generic";
+#endif
+
+    printf("NetWatch Pro 3.0.0 (%s %s)\n", osName, arch);
+    printf("Modern C++17 Zero-Dependency Terminal Network Diagnostics & Monitor\n");
+}
+
 static void showUsage(const char *prog) {
     printf(
         "NETWATCH PRO 3.0 – Terminal Network Monitor & Diagnostics Hub\n\n"
         "Usage: %s [options] [host ...]\n\n"
         "Options:\n"
-        "  -i <sec>      Interval between pings in seconds (default: 3)\n"
-        "  -t <sec>      Reply timeout in seconds (default: 2)\n"
-        "  -l <file>     Export ping metrics to CSV log file\n"
-        "  -a            Enable audio bell and OS notifications on outage\n"
-        "  -g            Automatically include default router/gateway\n"
-        "  -h, --help    Show this help message and exit\n\n"
+        "  -i <sec>        Interval between pings in seconds (default: 3)\n"
+        "  -t <sec>        Reply timeout in seconds (default: 2)\n"
+        "  -l <file>       Export ping metrics to CSV log file\n"
+        "  -a              Enable audio bell and OS notifications on outage\n"
+        "  -g              Automatically include default router/gateway\n"
+        "  -v, --version   Show version and system architecture\n"
+        "  -h, --help      Show this help message and exit\n\n"
         "Interactive Keybindings:\n"
-        "  1-6           Switch Views (Overview, Compare, Detail, Outages, Toolbox, Help)\n"
-        "  Tab / ← / →   Switch selected host\n"
-        "  a / d         Add new host / Delete selected host\n"
-        "  t             Open Network Toolbox (traceroute, dig, portscan, curl, etc.)\n"
-        "  r             Force immediate ping or re-run toolbox tool\n"
-        "  p             Pause / Resume pinging\n"
-        "  + / -         Adjust ping interval\n"
-        "  l             Toggle logarithmic / linear chart scale\n"
-        "  q / Esc       Quit\n",
+        "  1-6             Switch Views (Overview, Compare, Detail, Outages, Toolbox, Help)\n"
+        "  Tab / j / k     Navigate / switch selected host (or ← / → / ↑ / ↓)\n"
+        "  Enter           Inspect selected host (Detail view) or re-run active tool\n"
+        "  Esc / b         Back to Overview dashboard\n"
+        "  a / d           Add new host (supports URL/IP) / Delete selected host\n"
+        "  t               Open Network Toolbox (traceroute, dig, portscan, curl, etc.)\n"
+        "  r               Force immediate ping or re-run toolbox tool\n"
+        "  p               Pause / Resume pinging\n"
+        "  + / -           Adjust ping interval\n"
+        "  l               Toggle logarithmic / linear chart scale\n"
+        "  v               Toggle rich visual vs raw output in Toolbox\n"
+        "  s               Export report or snapshot to file\n"
+        "  /               Search output in Toolbox\n"
+        "  q / Ctrl+C      Quit NetWatch and show session summary\n",
         prog
     );
 }
@@ -2157,12 +2399,18 @@ int main(int argc, char **argv) {
     platformInitSockets();
     START_TIME = Clock::now();
 
+    string progName = (argc > 0 && argv[0]) ? argv[0] : "netwatch";
+    bool isPingInvoked = (progName.find("netping") != string::npos);
+
     vector<string> cliHosts;
     bool withGateway = false;
 
     for (int a = 1; a < argc; a++) {
         string k = argv[a];
-        if ((k == "-i" || k == "-t") && a + 1 < argc) {
+        if (k == "-v" || k == "--version" || k == "-V") {
+            showVersion();
+            return 0;
+        } else if ((k == "-i" || k == "-t") && a + 1 < argc) {
             int v = atoi(argv[++a]);
             if (v < 1) { showUsage(argv[0]); return 1; }
             (k == "-i" ? INTERVAL : TIMEOUT) = v;
@@ -2179,7 +2427,8 @@ int main(int argc, char **argv) {
             showUsage(argv[0]);
             return 1;
         } else {
-            cliHosts.push_back(k);
+            string cleaned = cleanHost(k);
+            if (!cleaned.empty()) cliHosts.push_back(cleaned);
         }
     }
 
@@ -2191,9 +2440,9 @@ int main(int argc, char **argv) {
             targets.push_back({h, h});
         }
     } else {
-        // Smart production defaults
-        targets.push_back({"Cloudflare DNS", "1.1.1.1"});
+        // Smart production defaults: Google DNS & Cloudflare DNS
         targets.push_back({"Google DNS", "8.8.8.8"});
+        targets.push_back({"Cloudflare DNS", "1.1.1.1"});
         withGateway = true; // Auto-detect router gateway by default
     }
 
@@ -2209,6 +2458,10 @@ int main(int argc, char **argv) {
         s.name = t.name;
         s.host = t.host;
         sites.push_back(s);
+    }
+
+    if (isPingInvoked && !sites.empty()) {
+        VIEW = 3; // Launch directly in Single-Host Detail View when called as netping
     }
 
     if (!g_logPath.empty()) {
@@ -2228,6 +2481,11 @@ int main(int argc, char **argv) {
     auto lastCheck = Clock::now();
 
     while (!g_quitRequested) {
+        // Handle window resize event immediately
+        if (g_resized) {
+            g_resized = 0;
+        }
+
         // Launch parallel ping probes if scheduled
         if (!checking && (forceProbe || (!PAUSED && !sites.empty() &&
             (std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastCheck).count() >= INTERVAL * 1000L)))) {
@@ -2267,13 +2525,30 @@ int main(int argc, char **argv) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
-        timeval tv{0, 100000}; // 100ms refresh
+        timeval tv{0, 60000}; // 60ms refresh for smooth responsiveness
         if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
-            char kb[64];
+            char kb[128];
             ssize_t n = read(STDIN_FILENO, kb, sizeof(kb));
+            if (n <= 0) {
+                if (n == 0 && !isatty(STDIN_FILENO)) {
+                    g_quitRequested = 1;
+                }
+                continue;
+            }
             for (ssize_t i = 0; i < n; i++) {
                 char ch = kb[i];
                 size_t cnt = sites.size();
+
+                // Ctrl+C (ASCII 3): instantly cancel modal or quit application
+                if (ch == 3) {
+                    if (g_modal != ModalMode::NONE) {
+                        g_modal = ModalMode::NONE;
+                        g_inputBuf.clear();
+                    } else {
+                        g_quitRequested = 1;
+                    }
+                    continue;
+                }
 
                 // Handle active text input modal
                 if (g_modal != ModalMode::NONE) {
@@ -2282,17 +2557,31 @@ int main(int argc, char **argv) {
                         g_inputBuf.clear();
                     } else if (ch == '\n' || ch == '\r') {
                         if (g_modal == ModalMode::ADD_HOST && !g_inputBuf.empty()) {
-                            Site newSite;
-                            newSite.name = g_inputBuf;
-                            newSite.host = g_inputBuf;
-                            sites.push_back(newSite);
-                            addEvent("Added target host: " + g_inputBuf);
-                            forceProbe = true;
+                            string clean = cleanHost(g_inputBuf);
+                            if (!clean.empty()) {
+                                if (checking) {
+                                    for (auto &w : workers) { if (w.joinable()) w.join(); }
+                                    workers.clear();
+                                    checking = false;
+                                }
+                                Site newSite;
+                                newSite.name = clean;
+                                newSite.host = clean;
+                                sites.push_back(newSite);
+                                addEvent("Added target host: " + clean);
+                                forceProbe = true;
+                            }
                         } else if (g_modal == ModalMode::SET_INTERVAL) {
                             int val = atoi(g_inputBuf.c_str());
                             if (val >= 1 && val <= 60) INTERVAL = val;
-                        } else if (g_modal == ModalMode::TOOL_CUSTOM_HOST && !g_inputBuf.empty()) {
+                        } else if (g_modal == ModalMode::TOOL_CUSTOM_CMD && !g_inputBuf.empty()) {
                             runCustomCommandTool(g_inputBuf);
+                        } else if (g_modal == ModalMode::TOOL_CUSTOM_HOST && !g_inputBuf.empty()) {
+                            string clean = cleanHost(g_inputBuf);
+                            if (!clean.empty()) {
+                                g_toolResult.targetHost = clean;
+                                launchTool(TOOL_ACTIVE_ID, clean);
+                            }
                         } else if (g_modal == ModalMode::TOOL_SEARCH) {
                             g_toolResult.searchQuery = g_inputBuf;
                         }
@@ -2300,41 +2589,86 @@ int main(int argc, char **argv) {
                         g_inputBuf.clear();
                     } else if (ch == 127 || ch == 8) { // Backspace
                         if (!g_inputBuf.empty()) g_inputBuf.pop_back();
+                    } else if (ch == 21) { // Ctrl+U: clear input line
+                        g_inputBuf.clear();
                     } else if (isprint((unsigned char)ch)) {
                         g_inputBuf += ch;
                     }
                     continue;
                 }
 
-                // Handle ANSI escape sequences (Arrow keys, PageUp/Down)
-                if (ch == 27 && i + 2 < n && kb[i + 1] == '[') {
-                    char c2 = kb[i + 2];
-                    i += 2;
-                    if (c2 == 'C' || c2 == 'B') { // Right / Down
-                        if (VIEW == 5) {
-                            g_toolResult.scrollOffset += 3;
-                        } else if (cnt) {
-                            SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                // Handle ANSI escape sequences (Arrow keys, Home, End, PageUp/Down)
+                if (ch == 27 && i + 1 < n && (kb[i + 1] == '[' || kb[i + 1] == 'O')) {
+                    char prefix = kb[i + 1];
+                    if (prefix == 'O' && i + 2 < n) {
+                        // Application cursor keys (SS3 mode on macOS Terminal / iTerm2)
+                        char c2 = kb[i + 2];
+                        i += 2;
+                        if (c2 == 'C') { // Right
+                            if (cnt) SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                        } else if (c2 == 'D') { // Left
+                            if (cnt) SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                        } else if (c2 == 'B') { // Down
+                            if (VIEW == 5) g_toolResult.scrollOffset += 3;
+                            else if (cnt) SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                        } else if (c2 == 'A') { // Up
+                            if (VIEW == 5) g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 3);
+                            else if (cnt) SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                        } else if (c2 == 'H') { // Home
+                            if (VIEW == 5) g_toolResult.scrollOffset = 0;
+                        } else if (c2 == 'F') { // End
+                            if (VIEW == 5) g_toolResult.scrollOffset = 99999;
                         }
-                    } else if (c2 == 'D' || c2 == 'A') { // Left / Up
-                        if (VIEW == 5) {
-                            g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 3);
-                        } else if (cnt) {
-                            SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                        continue;
+                    } else if (prefix == '[' && i + 2 < n) {
+                        char c2 = kb[i + 2];
+                        if (c2 == 'C') { // Right
+                            i += 2;
+                            if (cnt) SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                            continue;
+                        } else if (c2 == 'D') { // Left
+                            i += 2;
+                            if (cnt) SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                            continue;
+                        } else if (c2 == 'B') { // Down
+                            i += 2;
+                            if (VIEW == 5) g_toolResult.scrollOffset += 3;
+                            else if (cnt) SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                            continue;
+                        } else if (c2 == 'A') { // Up
+                            i += 2;
+                            if (VIEW == 5) g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 3);
+                            else if (cnt) SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                            continue;
+                        } else if (c2 == 'H') { // Home
+                            i += 2;
+                            if (VIEW == 5) g_toolResult.scrollOffset = 0;
+                            continue;
+                        } else if (c2 == 'F') { // End
+                            i += 2;
+                            if (VIEW == 5) g_toolResult.scrollOffset = 99999;
+                            continue;
+                        } else if ((c2 == '5' || c2 == '6' || c2 == '1' || c2 == '4') && i + 3 < n && kb[i + 3] == '~') {
+                            i += 3; // Consume full 4-byte sequence e.g. \x1b[5~
+                            if (c2 == '5') { // Page Up
+                                if (VIEW == 5) g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 12);
+                            } else if (c2 == '6') { // Page Down
+                                if (VIEW == 5) g_toolResult.scrollOffset += 12;
+                            } else if (c2 == '1') { // Home
+                                if (VIEW == 5) g_toolResult.scrollOffset = 0;
+                            } else if (c2 == '4') { // End
+                                if (VIEW == 5) g_toolResult.scrollOffset = 99999;
+                            }
+                            continue;
                         }
-                    } else if (c2 == '5') { // Page Up
-                        if (VIEW == 5) g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 12);
-                    } else if (c2 == '6') { // Page Down
-                        if (VIEW == 5) g_toolResult.scrollOffset += 12;
                     }
-                    continue;
                 }
 
                 // Normal Keybindings
                 if (ch == 'q' || ch == 'Q') {
                     g_quitRequested = 1;
                 } else if (VIEW == 5 && ch >= '1' && ch <= '9') {
-                    string tgt = sites.empty() ? "1.1.1.1" : sites[SEL_SITE % sites.size()].host;
+                    string tgt = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
                     if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
                     launchTool(ch - '0', tgt);
                 } else if (ch >= '1' && ch <= '6') {
@@ -2342,10 +2676,37 @@ int main(int argc, char **argv) {
                     if (VIEW == 5 && g_toolResult.type == ToolType::NONE && !sites.empty()) {
                         launchTool(1, sites[SEL_SITE % sites.size()].host);
                     }
-                } else if (ch == 27 || ch == 'b' || ch == 'B' || ch == 'o' || ch == 'O') {
+                } else if (ch == '\n' || ch == '\r') {
+                    // Enter / Return: intuitive drill-down navigation
+                    if (VIEW == 1 && !sites.empty()) {
+                        VIEW = 3; // Jump directly to Deep Dive Detail view
+                    } else if (VIEW == 3 && !sites.empty()) {
+                        VIEW = 5; // Jump from Detail to Network Toolbox
+                        if (g_toolResult.type == ToolType::NONE) {
+                            launchTool(1, sites[SEL_SITE % sites.size()].host);
+                        }
+                    } else if (VIEW == 5) {
+                        string tgt = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
+                        if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
+                        launchTool(TOOL_ACTIVE_ID, tgt);
+                    }
+                } else if (ch == 27 || ch == 'b' || ch == 'B') {
+                    // Esc / Back: return to Overview
                     if (VIEW != 1) VIEW = 1;
-                } else if (ch == '?') {
-                    VIEW = 6;
+                } else if (ch == '?' || ch == 'h' || ch == 'H') {
+                    VIEW = (VIEW == 6) ? 1 : 6;
+                } else if (ch == 'j' || ch == 'J') { // Vim Down
+                    if (VIEW == 5) {
+                        g_toolResult.scrollOffset += 3;
+                    } else if (cnt) {
+                        SEL_SITE = (SEL_SITE + 1) % (int)cnt;
+                    }
+                } else if (ch == 'k' || ch == 'K') { // Vim Up
+                    if (VIEW == 5) {
+                        g_toolResult.scrollOffset = std::max(0, g_toolResult.scrollOffset - 3);
+                    } else if (cnt) {
+                        SEL_SITE = (SEL_SITE + (int)cnt - 1) % (int)cnt;
+                    }
                 } else if (ch == '\t' && cnt) {
                     SEL_SITE = (SEL_SITE + 1) % (int)cnt;
                     if (VIEW == 5) {
@@ -2356,11 +2717,15 @@ int main(int argc, char **argv) {
                     if (VIEW == 5 && g_toolResult.type == ToolType::NONE && !sites.empty()) {
                         launchTool(1, sites[SEL_SITE % sites.size()].host);
                     }
-                } else if (ch == 'r' || ch == 'R' || (VIEW == 5 && (ch == '\n' || ch == '\r'))) {
+                } else if (ch == 'r' || ch == 'R') {
                     if (VIEW == 5) {
-                        string tgt = sites.empty() ? "1.1.1.1" : sites[SEL_SITE % sites.size()].host;
-                        if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
-                        launchTool(TOOL_ACTIVE_ID, tgt);
+                        if (TOOL_ACTIVE_ID == 9 && !g_toolResult.command.empty()) {
+                            runCustomCommandTool(g_toolResult.command);
+                        } else {
+                            string tgt = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
+                            if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
+                            launchTool(TOOL_ACTIVE_ID, tgt);
+                        }
                     } else if (!checking) {
                         forceProbe = true;
                     }
@@ -2368,10 +2733,15 @@ int main(int argc, char **argv) {
                     PAUSED = !PAUSED;
                 } else if (ch == 'a' || ch == 'A') {
                     g_modal = ModalMode::ADD_HOST;
-                    g_inputPrompt = "Enter Host or IP to monitor (e.g. google.com or 1.1.1.1): ";
+                    g_inputPrompt = "Enter Host or IP to monitor (e.g. google.com, 8.8.8.8): ";
                     g_inputBuf.clear();
                 } else if (ch == 'd' || ch == 'D') {
                     if (sites.size() > 1) {
+                        if (checking) {
+                            for (auto &w : workers) { if (w.joinable()) w.join(); }
+                            workers.clear();
+                            checking = false;
+                        }
                         addEvent("Removed site: " + sites[SEL_SITE % sites.size()].name);
                         sites.erase(sites.begin() + (SEL_SITE % sites.size()));
                         if (SEL_SITE >= (int)sites.size()) SEL_SITE = (int)sites.size() - 1;
@@ -2407,6 +2777,11 @@ int main(int argc, char **argv) {
                     }
                     addEvent("Exported report to " + fname);
                 } else if (ch == 'z' || ch == 'Z') {
+                    if (checking) {
+                        for (auto &w : workers) { if (w.joinable()) w.join(); }
+                        workers.clear();
+                        checking = false;
+                    }
                     for (auto &s : sites) s.resetStats();
                     outages.clear();
                     events.clear();
@@ -2417,19 +2792,27 @@ int main(int argc, char **argv) {
             }
         }
 #else
-        Sleep(100);
+        Sleep(60);
         if (_kbhit()) {
             char ch = (char)_getch();
-            if (ch == 'q' || ch == 'Q') g_quitRequested = 1;
+            if (ch == 'q' || ch == 'Q' || ch == 3) g_quitRequested = 1;
             else if (VIEW == 5 && ch >= '1' && ch <= '9') {
-                string tgt = sites.empty() ? "1.1.1.1" : sites[SEL_SITE % sites.size()].host;
+                string tgt = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
                 if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
                 launchTool(ch - '0', tgt);
             }
             else if (ch >= '1' && ch <= '6') VIEW = ch - '0';
             else if (ch == 27 || ch == 'b' || ch == 'B') VIEW = 1;
-            else if (ch == '\t' && !sites.empty()) {
+            else if (ch == '\r' || ch == '\n') {
+                if (VIEW == 1) VIEW = 3;
+                else if (VIEW == 3) VIEW = 5;
+            }
+            else if ((ch == '\t' || ch == 'j' || ch == 'J') && !sites.empty()) {
                 SEL_SITE = (SEL_SITE + 1) % (int)sites.size();
+                if (VIEW == 5) launchTool(TOOL_ACTIVE_ID, sites[SEL_SITE % sites.size()].host);
+            }
+            else if ((ch == 'k' || ch == 'K') && !sites.empty()) {
+                SEL_SITE = (SEL_SITE + (int)sites.size() - 1) % (int)sites.size();
                 if (VIEW == 5) launchTool(TOOL_ACTIVE_ID, sites[SEL_SITE % sites.size()].host);
             }
             else if (ch == 't' || ch == 'T') {
@@ -2441,8 +2824,13 @@ int main(int argc, char **argv) {
             else if (ch == 'p') PAUSED = !PAUSED;
             else if (ch == 'r') {
                 if (VIEW == 5) {
-                    string tgt = sites.empty() ? "1.1.1.1" : sites[SEL_SITE % sites.size()].host;
-                    launchTool(TOOL_ACTIVE_ID, tgt);
+                    if (TOOL_ACTIVE_ID == 9 && !g_toolResult.command.empty()) {
+                        runCustomCommandTool(g_toolResult.command);
+                    } else {
+                        string tgt = sites.empty() ? "8.8.8.8" : sites[SEL_SITE % sites.size()].host;
+                        if (!g_toolResult.targetHost.empty()) tgt = g_toolResult.targetHost;
+                        launchTool(TOOL_ACTIVE_ID, tgt);
+                    }
                 } else if (!checking) forceProbe = true;
             }
             else if (ch == 'v' && VIEW == 5) g_toolResult.rawView = !g_toolResult.rawView;
